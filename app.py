@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import tempfile
+import unicodedata
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
@@ -24,6 +25,12 @@ from TikTokLive.events import CommentEvent, ConnectEvent, DisconnectEvent
 APP_NAME = "Lector de comentarios TikTok LIVE"
 CONFIG_PATH = Path.home() / ".tiktok_live_lector.json"
 MAX_VISIBLE_COMMENTS = 250
+MAX_EVENT_BACKLOG = 500
+MAX_EVENTS_PER_TICK = 50
+MAX_COMMENT_LENGTH = 450
+MAX_NICKNAME_LENGTH = 80
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._]{2,24}$")
+UNSAFE_UNICODE = frozenset("\u200b\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff")
 VOICE_OPTIONS = {
     "Elvira · España (mujer)": "es-ES-ElviraNeural",
     "Álvaro · España (hombre)": "es-ES-AlvaroNeural",
@@ -39,10 +46,34 @@ def resource_path(relative: str) -> Path:
 
 def clean_username(value: str) -> str:
     value = value.strip()
-    match = re.search(r"tiktok\.com/@([A-Za-z0-9._-]+)", value, re.IGNORECASE)
+    match = re.fullmatch(
+        r"(?:https?://)?(?:www\.)?tiktok\.com/@([^/?#]+)(?:/[^?#]*)?(?:[?#].*)?",
+        value,
+        re.IGNORECASE,
+    )
     if match:
-        return match.group(1)
-    return value.lstrip("@").strip()
+        value = match.group(1)
+    candidate = value.lstrip("@").strip()
+    return candidate if USERNAME_PATTERN.fullmatch(candidate) else ""
+
+
+def clean_live_text(value: object, limit: int) -> str:
+    """Normalize untrusted LIVE text before display or speech."""
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    cleaned = "".join(
+        " " if unicodedata.category(char) == "Cc" or char in UNSAFE_UNICODE else char
+        for char in normalized
+    )
+    return " ".join(cleaned.split())[:limit].strip()
+
+
+def emit_event(events: queue.Queue, kind: str, payload: object) -> bool:
+    """Never let untrusted event floods block network or speech threads."""
+    try:
+        events.put_nowait((kind, payload))
+        return True
+    except queue.Full:
+        return False
 
 
 class SpeechWorker:
@@ -60,7 +91,7 @@ class SpeechWorker:
         try:
             self.items.put_nowait((text, rate, voice))
         except queue.Full:
-            self.events.put(("notice", "La cola de voz está llena; se omitió un comentario."))
+            emit_event(self.events, "notice", "La cola de voz está llena; se omitió un comentario.")
 
     def set_enabled(self, enabled: bool) -> None:
         if enabled:
@@ -92,10 +123,11 @@ class SpeechWorker:
                 speaker.Voice = spanish
             speaker.Volume = 100
         except Exception as exc:
-            self.events.put(("speech_error", f"No se pudo iniciar la voz de Windows: {exc}"))
+            emit_event(self.events, "speech_error", f"No se pudo iniciar la voz de Windows: {exc}")
             pythoncom.CoUninitialize()
             return
 
+        neural_fallback_active = False
         while True:
             item = self.items.get()
             if item is None:
@@ -105,15 +137,22 @@ class SpeechWorker:
             text, rate, voice = item
             try:
                 self._speak_neural(text, rate, voice)
+                neural_fallback_active = False
             except Exception as exc:
                 # Keep comments audible if the online neural service is
                 # temporarily unavailable.
-                self.events.put(("notice", f"Voz neuronal no disponible; usando la voz de Windows. ({exc})"))
+                if not neural_fallback_active:
+                    emit_event(
+                        self.events,
+                        "notice",
+                        f"Voz neuronal no disponible; usando la voz de Windows. ({exc})",
+                    )
+                    neural_fallback_active = True
                 try:
                     speaker.Rate = max(-6, min(6, round((rate - 190) / 18)))
                     speaker.Speak(text)
                 except Exception as fallback_exc:
-                    self.events.put(("speech_error", f"Error al leer un comentario: {fallback_exc}"))
+                    emit_event(self.events, "speech_error", f"Error al leer un comentario: {fallback_exc}")
         del voices, spanish, speaker
         pythoncom.CoUninitialize()
 
@@ -181,13 +220,13 @@ class LiveConnection:
                 message = f"No se encontró el usuario @{username}."
             else:
                 message = f"No se pudo conectar: {exc or name}"
-            self.events.put(("error", message))
+            emit_event(self.events, "error", message)
         finally:
             with self._lock:
                 self.running = False
             self.loop = None
             self.client = None
-            self.events.put(("stopped", None))
+            emit_event(self.events, "stopped", None)
 
     async def _listen(self, username: str) -> None:
         self.loop = asyncio.get_running_loop()
@@ -196,18 +235,21 @@ class LiveConnection:
 
         @client.on(ConnectEvent)
         async def on_connect(event: ConnectEvent) -> None:
-            self.events.put(("connected", username))
+            emit_event(self.events, "connected", username)
 
         @client.on(CommentEvent)
         async def on_comment(event: CommentEvent) -> None:
-            nickname = (event.user.nickname or event.user.unique_id or "Alguien").strip()
-            comment = (event.comment or "").strip()
+            nickname = clean_live_text(
+                event.user.nickname or event.user.unique_id or "Alguien",
+                MAX_NICKNAME_LENGTH,
+            )
+            comment = clean_live_text(event.comment, MAX_COMMENT_LENGTH)
             if comment:
-                self.events.put(("comment", (nickname, comment)))
+                emit_event(self.events, "comment", (nickname or "Alguien", comment))
 
         @client.on(DisconnectEvent)
         async def on_disconnect(event: DisconnectEvent) -> None:
-            self.events.put(("notice", "El LIVE se ha desconectado."))
+            emit_event(self.events, "notice", "El LIVE se ha desconectado.")
 
         task = await client.start(
             fetch_room_info=False,
@@ -232,7 +274,7 @@ class App(ctk.CTk):
         except tk.TclError:
             pass
 
-        self.events: queue.Queue = queue.Queue()
+        self.events: queue.Queue = queue.Queue(maxsize=MAX_EVENT_BACKLOG)
         self.connection = LiveConnection(self.events)
         self.speech = SpeechWorker(self.events)
         self.comment_count = 0
@@ -250,97 +292,6 @@ class App(ctk.CTk):
         self._build_modern_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_events)
-
-    def _configure_style(self) -> None:
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("TFrame", background="#101114")
-        style.configure("Card.TFrame", background="#191b20")
-        style.configure("TLabel", background="#101114", foreground="#f5f5f5", font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", foreground="#a8abb4")
-        style.configure("Title.TLabel", font=("Segoe UI Semibold", 20))
-        style.configure("Card.TCheckbutton", background="#191b20", foreground="#f5f5f5")
-        style.map("Card.TCheckbutton", background=[("active", "#191b20")])
-        style.configure("Accent.TButton", background="#fe2c55", foreground="white", padding=(18, 9))
-        style.map("Accent.TButton", background=[("active", "#db2147"), ("disabled", "#5f303b")])
-        style.configure("Stop.TButton", background="#30333b", foreground="white", padding=(18, 9))
-
-    def _build_ui(self) -> None:
-        outer = ttk.Frame(self, padding=24)
-        outer.pack(fill="both", expand=True)
-
-        ttk.Label(outer, text="Lector de comentarios", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="Conecta con un TikTok LIVE y escucha sus comentarios en tiempo real.",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=(2, 18))
-
-        connection_card = ttk.Frame(outer, style="Card.TFrame", padding=16)
-        connection_card.pack(fill="x")
-        ttk.Label(connection_card, text="Usuario del LIVE", background="#191b20").grid(row=0, column=0, sticky="w")
-        self.user_entry = ttk.Entry(connection_card, textvariable=self.username, font=("Segoe UI", 11))
-        self.user_entry.grid(row=1, column=0, sticky="ew", pady=(6, 0), padx=(0, 10))
-        self.user_entry.bind("<Return>", lambda _event: self._connect())
-        self.connect_button = ttk.Button(connection_card, text="Conectar", style="Accent.TButton", command=self._connect)
-        self.connect_button.grid(row=1, column=1, padx=(0, 8))
-        self.stop_button = ttk.Button(connection_card, text="Parar", style="Stop.TButton", command=self._disconnect, state="disabled")
-        self.stop_button.grid(row=1, column=2)
-        connection_card.columnconfigure(0, weight=1)
-
-        options = ttk.Frame(outer, style="Card.TFrame", padding=14)
-        options.pack(fill="x", pady=12)
-        ttk.Checkbutton(
-            options, text="Leer nombres", variable=self.read_names, style="Card.TCheckbutton"
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(
-            options,
-            text="Voz activada",
-            variable=self.voice_enabled,
-            command=self._toggle_voice,
-            style="Card.TCheckbutton",
-        ).grid(row=0, column=1, sticky="w", padx=24)
-        ttk.Button(options, text="Probar voz", command=self._test_voice).grid(row=0, column=2, sticky="e")
-        ttk.Label(options, text="Voz natural", background="#191b20").grid(row=1, column=0, sticky="w", pady=(12, 0))
-        self.voice_combo = ttk.Combobox(
-            options, textvariable=self.voice, values=list(VOICE_OPTIONS), state="readonly", width=28
-        )
-        self.voice_combo.grid(row=1, column=1, sticky="ew", padx=(0, 18), pady=(12, 0))
-        speed_frame = ttk.Frame(options, style="Card.TFrame")
-        speed_frame.grid(row=1, column=2, sticky="ew", pady=(12, 0))
-        ttk.Label(speed_frame, text="Velocidad", background="#191b20").pack(side="left")
-        ttk.Scale(speed_frame, from_=120, to=260, variable=self.rate, orient="horizontal").pack(
-            side="left", fill="x", expand=True, padx=(10, 0)
-        )
-        options.columnconfigure(1, weight=1)
-        options.columnconfigure(2, weight=1)
-
-        status_row = ttk.Frame(outer)
-        status_row.pack(fill="x", pady=(2, 7))
-        ttk.Label(status_row, textvariable=self.status).pack(side="left")
-        ttk.Label(status_row, textvariable=self.counter, style="Muted.TLabel").pack(side="right")
-
-        log_frame = ttk.Frame(outer, style="Card.TFrame")
-        log_frame.pack(fill="both", expand=True)
-        self.log = tk.Text(
-            log_frame,
-            wrap="word",
-            state="disabled",
-            bg="#191b20",
-            fg="#f3f3f3",
-            insertbackground="white",
-            selectbackground="#3c4250",
-            relief="flat",
-            padx=14,
-            pady=12,
-            font=("Segoe UI", 10),
-        )
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
-        self.log.configure(yscrollcommand=scrollbar.set)
-        self.log.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.log.tag_configure("name", foreground="#25f4ee", font=("Segoe UI Semibold", 10))
-        self.log.tag_configure("notice", foreground="#a8abb4", font=("Segoe UI", 9, "italic"))
 
     def _build_modern_ui(self) -> None:
         outer = ctk.CTkFrame(self, fg_color="transparent")
@@ -461,7 +412,10 @@ class App(ctk.CTk):
     def _connect(self) -> None:
         username = clean_username(self.username.get())
         if not username:
-            messagebox.showinfo(APP_NAME, "Escribe el @usuario que está haciendo el LIVE.")
+            messagebox.showinfo(
+                APP_NAME,
+                "Escribe un @usuario válido de TikTok (solo letras, números, puntos o guiones bajos).",
+            )
             self.user_entry.focus_set()
             return
         self.username.set(username)
@@ -493,9 +447,11 @@ class App(ctk.CTk):
         self._add_notice("Prueba de voz neuronal enviada. Puede tardar un instante.")
 
     def _poll_events(self) -> None:
+        processed = 0
         try:
-            while True:
+            while processed < MAX_EVENTS_PER_TICK:
                 kind, payload = self.events.get_nowait()
+                processed += 1
                 if kind == "connected":
                     self.status.set(f"● Conectado a @{payload}")
                     self._add_notice("Conectado. Esperando comentarios…")
