@@ -29,6 +29,9 @@ MAX_EVENT_BACKLOG = 500
 MAX_EVENTS_PER_TICK = 50
 MAX_COMMENT_LENGTH = 450
 MAX_NICKNAME_LENGTH = 80
+MAX_SPEECH_BACKLOG = 1000
+MAX_SPEECH_BATCH_ITEMS = 6
+MAX_SPEECH_BATCH_CHARS = 1800
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._]{2,24}$")
 UNSAFE_UNICODE = frozenset("\u200b\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff")
 VOICE_OPTIONS = {
@@ -79,7 +82,9 @@ def emit_event(events: queue.Queue, kind: str, payload: object) -> bool:
 class SpeechWorker:
     def __init__(self, events: queue.Queue):
         self.events = events
-        self.items: queue.Queue[tuple[str, int, str] | None] = queue.Queue(maxsize=100)
+        self.items: queue.Queue[tuple[str, int, str] | None] = queue.Queue(
+            maxsize=MAX_SPEECH_BACKLOG
+        )
         self.enabled = threading.Event()
         self.enabled.set()
         self.thread = threading.Thread(target=self._run, daemon=True, name="lector-voz")
@@ -128,15 +133,48 @@ class SpeechWorker:
             return
 
         neural_fallback_active = False
+        pending_item: tuple[str, int, str] | None = None
         while True:
-            item = self.items.get()
+            item = pending_item if pending_item is not None else self.items.get()
+            pending_item = None
             if item is None:
                 break
             if not self.enabled.is_set():
                 continue
+
             text, rate, voice = item
+            batch = [text]
+            batch_chars = len(text)
+            stop_after_batch = False
+
+            # A neural request per individual comment is too slow during busy
+            # LIVEs. Briefly collect consecutive comments and synthesize them
+            # together, preserving their order and every speaker name.
+            while len(batch) < MAX_SPEECH_BATCH_ITEMS:
+                try:
+                    next_item = self.items.get(timeout=0.12 if len(batch) == 1 else 0.02)
+                except queue.Empty:
+                    break
+                if next_item is None:
+                    stop_after_batch = True
+                    break
+                next_text, next_rate, next_voice = next_item
+                if (
+                    next_voice != voice
+                    or next_rate != rate
+                    or batch_chars + len(next_text) + 2 > MAX_SPEECH_BATCH_CHARS
+                ):
+                    pending_item = next_item
+                    break
+                batch.append(next_text)
+                batch_chars += len(next_text) + 2
+
+            text = ". ".join(batch)
+            # Catch up gradually when chat is busy without making normal
+            # conversations sound unnaturally fast.
+            adaptive_rate = min(260, rate + min(70, self.items.qsize() * 2))
             try:
-                self._speak_neural(text, rate, voice)
+                self._speak_neural(text, adaptive_rate, voice)
                 neural_fallback_active = False
             except Exception as exc:
                 # Keep comments audible if the online neural service is
@@ -149,10 +187,12 @@ class SpeechWorker:
                     )
                     neural_fallback_active = True
                 try:
-                    speaker.Rate = max(-6, min(6, round((rate - 190) / 18)))
+                    speaker.Rate = max(-6, min(6, round((adaptive_rate - 190) / 18)))
                     speaker.Speak(text)
                 except Exception as fallback_exc:
                     emit_event(self.events, "speech_error", f"Error al leer un comentario: {fallback_exc}")
+            if stop_after_batch:
+                break
         del voices, spanish, speaker
         pythoncom.CoUninitialize()
 
