@@ -1,0 +1,8 @@
+.venv/
+build/
+.build-temp/
+dist/
+*.spec
+__pycache__/
+config.json
+assets/app-icon-chroma.png

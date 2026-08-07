@@ -1,0 +1,6 @@
+TikTokLive==6.6.6
+pywin32==312
+edge-tts==7.2.8
+pyinstaller==6.21.0
+customtkinter==5.2.2
+Pillow==12.3.0
