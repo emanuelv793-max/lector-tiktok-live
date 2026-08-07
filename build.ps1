@@ -1,4 +1,12 @@
+param(
+    [string]$DistPath
+)
+
 $ErrorActionPreference = "Stop"
+
+if (-not $DistPath) {
+    $DistPath = Join-Path $PSScriptRoot "dist"
+}
 
 $python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 $workPath = Join-Path $PSScriptRoot (".build-temp\" + [guid]::NewGuid().ToString("N"))
@@ -10,6 +18,7 @@ if (-not (Test-Path -LiteralPath $python)) {
     --noconfirm `
     --clean `
     --workpath $workPath `
+    --distpath $DistPath `
     --onefile `
     --windowed `
     --noupx `
@@ -27,4 +36,4 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller no pudo crear el ejecutable (código $LASTEXITCODE)."
 }
 
-Write-Host "Ejecutable creado en: $PSScriptRoot\dist\LectorTikTokLive-Moderno.exe"
+Write-Host "Ejecutable creado en: $DistPath\LectorTikTokLive-Moderno.exe"
