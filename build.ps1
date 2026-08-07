@@ -12,6 +12,7 @@ if (-not (Test-Path -LiteralPath $python)) {
     --workpath $workPath `
     --onefile `
     --windowed `
+    --noupx `
     --name "LectorTikTokLive-Moderno" `
     --icon "$PSScriptRoot\assets\app-icon.ico" `
     --add-data "$PSScriptRoot\assets;assets" `
