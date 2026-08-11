@@ -34,6 +34,9 @@ MAX_SPEECH_BATCH_ITEMS = 6
 MAX_SPEECH_BATCH_CHARS = 1800
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._]{2,24}$")
 UNSAFE_UNICODE = frozenset("\u200b\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff")
+EMOJI_JOINER = "\u200d"
+EMOJI_VARIATION_SELECTOR = "\ufe0f"
+EMOJI_KEYCAP = "\u20e3"
 VOICE_OPTIONS = {
     "Elvira · España (mujer)": "es-ES-ElviraNeural",
     "Álvaro · España (hombre)": "es-ES-AlvaroNeural",
@@ -68,6 +71,101 @@ def clean_live_text(value: object, limit: int) -> str:
         for char in normalized
     )
     return " ".join(cleaned.split())[:limit].strip()
+
+
+def _is_emoji_base(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        0x1F000 <= codepoint <= 0x1FAFF
+        or 0x2600 <= codepoint <= 0x27BF
+        or 0x2B00 <= codepoint <= 0x2BFF
+        or 0x1F1E6 <= codepoint <= 0x1F1FF
+        or codepoint
+        in {
+            0x00A9,
+            0x00AE,
+            0x203C,
+            0x2049,
+            0x2122,
+            0x2139,
+            0x231A,
+            0x231B,
+            0x2328,
+            0x23CF,
+            0x23E9,
+            0x23EA,
+            0x23EB,
+            0x23EC,
+            0x23F0,
+            0x23F3,
+            0x3030,
+            0x303D,
+            0x3297,
+            0x3299,
+        }
+    )
+
+
+def _emoji_spans(text: str) -> list[tuple[int, int]]:
+    """Return spans for emoji graphemes, including flags and ZWJ sequences."""
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        start = index
+        char = text[index]
+
+        if char in "#*0123456789":
+            cursor = index + 1
+            if cursor < len(text) and text[cursor] == EMOJI_VARIATION_SELECTOR:
+                cursor += 1
+            if cursor < len(text) and text[cursor] == EMOJI_KEYCAP:
+                spans.append((start, cursor + 1))
+                index = cursor + 1
+                continue
+
+        if not _is_emoji_base(char):
+            index += 1
+            continue
+
+        cursor = index + 1
+        if 0x1F1E6 <= ord(char) <= 0x1F1FF:
+            if cursor < len(text) and 0x1F1E6 <= ord(text[cursor]) <= 0x1F1FF:
+                cursor += 1
+        else:
+            while cursor < len(text) and (
+                text[cursor] == EMOJI_VARIATION_SELECTOR
+                or 0x1F3FB <= ord(text[cursor]) <= 0x1F3FF
+            ):
+                cursor += 1
+            while cursor + 1 < len(text) and text[cursor] == EMOJI_JOINER:
+                if not _is_emoji_base(text[cursor + 1]):
+                    break
+                cursor += 2
+                while cursor < len(text) and (
+                    text[cursor] == EMOJI_VARIATION_SELECTOR
+                    or 0x1F3FB <= ord(text[cursor]) <= 0x1F3FF
+                ):
+                    cursor += 1
+
+        spans.append((start, cursor))
+        index = cursor
+    return spans
+
+
+def prepare_comment_for_speech(comment: str) -> str:
+    """Keep one emoji, but omit all emoji speech when a comment has several."""
+    spans = _emoji_spans(comment)
+    if len(spans) < 2:
+        return comment
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        parts.append(comment[cursor:start])
+        cursor = end
+    parts.append(comment[cursor:])
+    cleaned = " ".join("".join(parts).split())
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return cleaned.strip(" ,.;:-")
 
 
 def emit_event(events: queue.Queue, kind: str, payload: object) -> bool:
@@ -498,8 +596,18 @@ class App(ctk.CTk):
                 elif kind == "comment":
                     nickname, comment = payload
                     self._add_comment(nickname, comment)
-                    spoken = f"{nickname} dice: {comment}" if self.read_names.get() else comment
-                    self.speech.say(spoken[:450], int(self.rate.get()), VOICE_OPTIONS[self.voice.get()])
+                    spoken_comment = prepare_comment_for_speech(comment)
+                    if spoken_comment:
+                        spoken = (
+                            f"{nickname} dice: {spoken_comment}"
+                            if self.read_names.get()
+                            else spoken_comment
+                        )
+                        self.speech.say(
+                            spoken[:450],
+                            int(self.rate.get()),
+                            VOICE_OPTIONS[self.voice.get()],
+                        )
                 elif kind == "notice":
                     self._add_notice(payload)
                 elif kind == "error":
