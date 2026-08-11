@@ -1,7 +1,7 @@
 import queue
 import unittest
 
-from app import clean_live_text, clean_username, emit_event
+from app import clean_live_text, clean_username, emit_event, prepare_comment_for_speech
 
 
 class InputSecurityTests(unittest.TestCase):
@@ -30,6 +30,26 @@ class InputSecurityTests(unittest.TestCase):
         events = queue.Queue(maxsize=1)
         self.assertTrue(emit_event(events, "notice", "primero"))
         self.assertFalse(emit_event(events, "notice", "segundo"))
+
+    def test_keeps_a_single_emoji_for_speech(self):
+        self.assertEqual(prepare_comment_for_speech("Me gusta 😂"), "Me gusta 😂")
+
+    def test_removes_multiple_emojis_but_keeps_words(self):
+        self.assertEqual(
+            prepare_comment_for_speech("Hola 😂😂, buen directo ❤️"),
+            "Hola, buen directo",
+        )
+
+    def test_treats_flag_and_family_as_single_emojis(self):
+        self.assertEqual(prepare_comment_for_speech("España 🇪🇸"), "España 🇪🇸")
+        self.assertEqual(prepare_comment_for_speech("Familia 👨‍👩‍👧‍👦"), "Familia 👨‍👩‍👧‍👦")
+        self.assertEqual(
+            prepare_comment_for_speech("Saludos 🇪🇸 👨‍👩‍👧‍👦"),
+            "Saludos",
+        )
+
+    def test_only_multiple_emojis_produces_no_speech(self):
+        self.assertEqual(prepare_comment_for_speech("🔥🔥🔥"), "")
 
 
 if __name__ == "__main__":
